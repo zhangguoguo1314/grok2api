@@ -16,17 +16,23 @@ router = APIRouter(tags=["admin"], dependencies=[Depends(verify_app_key)])
 
 
 async def _test_proxy(proxy_url: str):
-    """Test a single proxy by connecting to grok.com through it."""
+    """Test a single proxy by connecting to a neutral site (httpbin.org) through it.
+    
+    Uses httpbin.org instead of grok.com to avoid Cloudflare false positives.
+    A proxy that passes this test is alive; grok.com accessibility is handled
+    separately by the retry/rotation mechanism.
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
     start = time.time()
     try:
+        # Use a neutral, lightweight endpoint for proxy health check
         req = urllib.request.Request(
-            "https://grok.com",
+            "https://httpbin.org/ip",
             headers={"User-Agent": "Mozilla/5.0"},
-            method="HEAD",
+            method="GET",
         )
         parsed = proxy_url.split("://")
         if len(parsed) >= 2:
@@ -35,6 +41,7 @@ async def _test_proxy(proxy_url: str):
             if scheme in ("http", "https"):
                 req.set_proxy(rest, scheme)
             else:
+                # SOCKS proxy: just test TCP connectivity
                 import socket
                 host_port = rest.split("@")[-1]
                 host, port_str = host_port.rsplit(":", 1)
