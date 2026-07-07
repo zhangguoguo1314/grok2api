@@ -1,0 +1,9 @@
+fastapi>=0.119.0
+granian>=2.7.2
+uvicorn>=0.22.0
+orjson>=3.11.4
+python-dotenv>=1.0.0
+aiofiles>=25.1.0
+aiohttp>=3.13.3
+aiohttp-socks>=0.11.0
+loguru>=0.7.3
