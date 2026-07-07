@@ -1,0 +1,86 @@
+name: Deploy to Hugging Face Spaces
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Git
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Check and create HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_USERNAME: ${{ secrets.HF_USERNAME }}
+        run: |
+          SPACE_NAME="clar9"
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $HF_TOKEN" \
+            "https://huggingface.co/api/spaces/$HF_USERNAME/$SPACE_NAME")
+          if [ "$RESPONSE" = "404" ]; then
+            echo "Space does not exist, creating..."
+            curl -X POST \
+              -H "Authorization: Bearer $HF_TOKEN" \
+              -H "Content-Type: application/json" \
+              https://huggingface.co/api/repos/create \
+              -d "{\"name\":\"$SPACE_NAME\",\"type\":\"space\",\"sdk\":\"docker\"}"
+          else
+            echo "Space exists (HTTP $RESPONSE)"
+          fi
+
+      - name: Sync files to HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_USERNAME: ${{ secrets.HF_USERNAME }}
+        run: |
+          set -eux
+          rm -rf hf-space
+          mkdir hf-space
+          cd hf-space
+          git init
+          git remote add origin "https://user:$HF_TOKEN@huggingface.co/spaces/$HF_USERNAME/clar9"
+          git fetch origin || true
+          git checkout -B main
+          git pull origin main || true
+
+          # Clean existing tracked files but keep .git
+          git rm -rf . > /dev/null 2>&1 || true
+
+          cd ..
+
+          # Copy project files (exclude unwanted)
+          cp -r app config.defaults.toml config.toml docker-compose.yml \
+            Dockerfile.hf main.py pyproject.toml requirements.txt scripts uv.lock \
+            README.md LICENSE render.yaml vercel.json \
+            _public docs hf-space/ 2>/dev/null || true
+
+          # Use HF-specific Dockerfile
+          cd hf-space
+          mv Dockerfile.hf Dockerfile 2>/dev/null || true
+
+          # Remove binary files (HF rejects them without Xet)
+          find . -type f \( -name "*.png" -o -name "*.ico" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.gif" -o -name "*.webp" -o -name "*.woff" -o -name "*.woff2" -o -name "*.ttf" -o -name "*.eot" \) -delete
+
+          # Ensure .gitignore doesn't block necessary files
+          echo "data/" > .gitignore
+          echo "logs/" >> .gitignore
+          echo "__pycache__/" >> .gitignore
+          echo "node_modules/" >> .gitignore
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Sync from GitHub $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push -u origin main --force
+          fi

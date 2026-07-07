@@ -1,0 +1,30 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Shanghai \
+    SERVER_HOST=0.0.0.0 \
+    SERVER_PORT=7860 \
+    SERVER_WORKERS=1 \
+    LOG_LEVEL=INFO
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 user
+
+WORKDIR /app
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . /app/
+
+RUN mkdir -p /app/data /app/logs \
+    && chown -R user:user /app/data /app/logs
+
+EXPOSE 7860
+USER user
+ENV HOME=/home/user
+
+CMD ["granian", "--interface", "asgi", "--host", "0.0.0.0", "--port", "7860", "--workers", "1", "main:app"]
