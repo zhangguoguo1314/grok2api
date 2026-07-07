@@ -52,7 +52,7 @@ async def _test_proxy(proxy_url: str):
         return False, None, str(e)[:200]
 
 
-@router.get("/v1/admin/proxies")
+@router.get("/proxies")
 async def list_proxies():
     """List all proxies with health status."""
     proxies = get_proxy_health("proxy.base_proxy_url")
@@ -63,7 +63,7 @@ async def list_proxies():
     }
 
 
-@router.post("/v1/admin/proxies")
+@router.post("/proxies")
 async def import_proxies(request: Request):
     """Import proxy list (newline or comma separated)."""
     body = await request.body()
@@ -83,7 +83,7 @@ async def import_proxies(request: Request):
     return {"success": True, "imported": len(proxies), "proxies": proxies}
 
 
-@router.post("/v1/admin/proxies/refresh")
+@router.post("/proxies/refresh")
 async def refresh_proxy_pool():
     """Refresh all proxy health status."""
     proxies = get_proxy_health("proxy.base_proxy_url")
@@ -115,7 +115,7 @@ async def refresh_proxy_pool():
     }
 
 
-@router.delete("/v1/admin/proxies")
+@router.delete("/proxies")
 async def clear_proxies():
     """Clear all proxies."""
     await config.update({"proxy": {"base_proxy_url": ""}})
