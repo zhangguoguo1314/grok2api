@@ -1,9 +1,10 @@
 """Admin proxy pool management API."""
 
 import asyncio
+import socket
 import time
-import urllib.request
 import ssl
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, Request
 
@@ -14,49 +15,97 @@ from app.core.proxy_pool import get_proxy_health, set_proxies_list, set_proxy_he
 
 router = APIRouter(tags=["admin"], dependencies=[Depends(verify_app_key)])
 
+# Thread pool for blocking socket operations
+_executor = ThreadPoolExecutor(max_workers=20)
 
-async def _test_proxy(proxy_url: str):
-    """Test a single proxy by connecting to a neutral site (httpbin.org) through it.
-    
-    Uses httpbin.org instead of grok.com to avoid Cloudflare false positives.
-    A proxy that passes this test is alive; grok.com accessibility is handled
-    separately by the retry/rotation mechanism.
-    """
+# Test target - neutral site to avoid Cloudflare false positives
+_TEST_TARGET = "httpbin.org"
+_TEST_PORT = 443
+_TEST_TIMEOUT = 6  # seconds per proxy
+
+
+def _tcp_test(host: str, port: int, timeout: float) -> tuple[bool, float, str]:
+    """Blocking TCP connectivity test. Runs in thread pool."""
+    start = time.time()
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        elapsed = time.time() - start
+        sock.close()
+        return True, elapsed, ""
+    except Exception as e:
+        return False, time.time() - start, str(e)[:100]
+
+
+def _http_test(proxy_url: str, timeout: float) -> tuple[bool, float, str]:
+    """Test HTTP/HTTPS proxy by fetching httpbin.org/ip through it. Blocking."""
+    import urllib.request
+
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
     start = time.time()
     try:
-        # Use a neutral, lightweight endpoint for proxy health check
         req = urllib.request.Request(
-            "https://httpbin.org/ip",
-            headers={"User-Agent": "Mozilla/5.0"},
+            f"https://{_TEST_TARGET}/ip",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
             method="GET",
         )
         parsed = proxy_url.split("://")
         if len(parsed) >= 2:
             scheme = parsed[0]
             rest = parsed[1] if len(parsed) == 2 else "://".join(parsed[1:])
-            if scheme in ("http", "https"):
-                req.set_proxy(rest, scheme)
-            else:
-                # SOCKS proxy: just test TCP connectivity
-                import socket
-                host_port = rest.split("@")[-1]
-                host, port_str = host_port.rsplit(":", 1)
-                port = int(port_str)
-                sock = socket.create_connection((host, port), timeout=8)
-                sock.close()
-                return True, time.time() - start, ""
+            req.set_proxy(rest, scheme)
 
-        with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             elapsed = time.time() - start
             if resp.status < 400:
                 return True, elapsed, ""
             return False, elapsed, f"HTTP {resp.status}"
     except Exception as e:
-        return False, None, str(e)[:200]
+        return False, time.time() - start, str(e)[:100]
+
+
+def _test_proxy_sync(proxy_url: str) -> tuple[bool, float, str]:
+    """Synchronous proxy test (runs in thread pool)."""
+    start = time.time()
+    parsed = proxy_url.split("://")
+    if len(parsed) < 2:
+        return False, 0, "Invalid URL"
+
+    scheme = parsed[0].lower()
+    rest = parsed[1] if len(parsed) == 2 else "://".join(parsed[1:])
+
+    # Extract host:port (handle auth)
+    host_port = rest.split("@")[-1]
+    if ":" not in host_port:
+        return False, 0, "No port specified"
+
+    host = host_port.rsplit(":", 1)[0]
+    port_str = host_port.rsplit(":", 1)[1]
+    try:
+        port = int(port_str)
+    except ValueError:
+        return False, 0, "Invalid port"
+
+    # Step 1: TCP connectivity test
+    ok, elapsed, err = _tcp_test(host, port, _TEST_TIMEOUT)
+    if not ok:
+        return False, elapsed, f"TCP: {err}"
+
+    # Step 2: For HTTP/HTTPS proxies, also test HTTP through proxy
+    if scheme in ("http", "https"):
+        ok, elapsed, err = _http_test(proxy_url, _TEST_TIMEOUT)
+        return ok, elapsed, err
+
+    # SOCKS proxies: TCP test is sufficient
+    return True, time.time() - start, ""
+
+
+async def _test_proxy_async(proxy_url: str) -> tuple[bool, float, str]:
+    """Async wrapper for sync proxy test."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, _test_proxy_sync, proxy_url)
 
 
 @router.get("/proxies")
@@ -92,24 +141,29 @@ async def import_proxies(request: Request):
 
 @router.post("/proxies/refresh")
 async def refresh_proxy_pool():
-    """Refresh all proxy health status."""
+    """Refresh all proxy health status with concurrency control."""
     proxies = get_proxy_health("proxy.base_proxy_url")
     if not proxies:
         return {"success": True, "total": 0, "healthy": 0, "unhealthy": 0, "results": {}}
 
-    tasks = [_test_proxy(p["url"]) for p in proxies]
+    # Limit concurrency to avoid overwhelming HF Space resources
+    semaphore = asyncio.Semaphore(5)
+
+    async def _limited_test(proxy_info: dict) -> tuple[str, bool, float, str]:
+        async with semaphore:
+            result = await _test_proxy_async(proxy_info["url"])
+            return proxy_info["url"], result[0], result[1], result[2]
+
+    tasks = [_limited_test(p) for p in proxies]
     checked = await asyncio.gather(*tasks, return_exceptions=True)
 
     results = {}
-    for i, p in enumerate(proxies):
-        result = checked[i]
-        if isinstance(result, Exception):
-            healthy, latency, error = False, None, str(result)[:200]
-        else:
-            healthy, latency, error = result
-
-        set_proxy_health("proxy.base_proxy_url", p["url"], healthy)
-        results[p["url"]] = {"ok": healthy, "latency": latency, "error": error}
+    for item in checked:
+        if isinstance(item, Exception):
+            continue
+        url, ok, latency, error = item
+        set_proxy_health("proxy.base_proxy_url", url, ok)
+        results[url] = {"ok": ok, "latency": latency, "error": error}
 
     healthy_count = sum(1 for r in results.values() if r["ok"])
     logger.info(f"ProxyPool refresh: {healthy_count}/{len(proxies)} healthy")

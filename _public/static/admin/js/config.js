@@ -670,9 +670,12 @@ function injectProxyManager() {
   panel.className = 'config-section mt-8';
   panel.innerHTML = `
     <div class="config-section-title">代理池管理</div>
-    <p class="text-[var(--accents-4)] text-sm mt-1 mb-4">自动检测代理可用性，只使用健康的代理访问 Grok。</p>
+    <p class="text-[var(--accents-4)] text-sm mt-1 mb-4">
+      自动检测代理可用性，只使用健康的代理访问 Grok。<br>
+      检测方式：TCP连通 + HTTP代理测速，最多5个并发。
+    </p>
 
-    <div class="flex items-center gap-3 mb-4">
+    <div class="flex items-center gap-3 mb-4 flex-wrap">
       <button onclick="refreshProxyPool()" id="proxy-refresh-btn" class="geist-button-outline gap-2">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
         <span>刷新检测</span>
@@ -688,7 +691,7 @@ function injectProxyManager() {
       <textarea id="proxy-import-area" rows="4" class="w-full px-3 py-2 border border-[var(--border)] rounded-md text-sm bg-[var(--bg)]"
         placeholder="粘贴代理列表，每行一个或逗号分隔&#10;http://host:port&#10;socks5://host:port&#10;https://user:pass@host:port"></textarea>
       <div class="flex justify-end mt-2">
-        <button onclick="importProxyPool()" class="geist-button gap-2">
+        <button onclick="importProxyPool()" id="proxy-import-btn" class="geist-button gap-2">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
           <span>导入代理</span>
         </button>
@@ -703,74 +706,171 @@ function injectProxyManager() {
   loadProxyStatus();
 }
 
+function _truncateUrl(url, max) {
+  if (url.length <= max) return url;
+  const half = Math.floor((max - 3) / 2);
+  return url.substring(0, half) + '...' + url.substring(url.length - half);
+}
+
 async function loadProxyStatus() {
   const container = byId('proxy-list-container');
   const stats = byId('proxy-stats');
   if (!container) return;
+
+  container.innerHTML = '<div class="text-center py-4 text-[var(--accents-4)] text-sm">正在加载代理列表...</div>';
+
   try {
-    const res = await fetch('/v1/admin/proxies', { headers: buildAuthHeaders(apiKey) });
-    if (!res.ok) { container.innerHTML = '<div class="text-center py-4 text-[var(--accents-4)] text-sm">加载失败</div>'; return; }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    const res = await fetch('/v1/admin/proxies', {
+      headers: buildAuthHeaders(apiKey),
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      container.innerHTML = '<div class="text-center py-4 text-red-500 text-sm">加载失败 (HTTP ' + res.status + ')</div>';
+      return;
+    }
+
     const data = await res.json();
     const proxies = data.proxies || [];
-    if (stats) stats.textContent = `健康 ${data.healthy_count || 0} / 异常 ${data.unhealthy_count || 0}`;
-    if (proxies.length === 0) { container.innerHTML = '<div class="text-center py-4 text-[var(--accents-4)] text-sm">暂无代理，请在上方导入</div>'; return; }
+
+    if (stats) stats.textContent = proxies.length > 0
+      ? ('健康 ' + (data.healthy_count || 0) + ' / 异常 ' + (data.unhealthy_count || 0))
+      : '';
+
+    if (proxies.length === 0) {
+      container.innerHTML = '<div class="text-center py-4 text-[var(--accents-4)] text-sm">暂无代理，请在上方导入</div>';
+      return;
+    }
+
     let html = '<div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr class="border-b border-[var(--border)]">';
     html += '<th class="text-left py-2 px-2 font-medium text-[var(--accents-4)]">代理地址</th>';
     html += '<th class="text-left py-2 px-2 font-medium text-[var(--accents-4)] w-20">状态</th>';
     html += '<th class="text-left py-2 px-2 font-medium text-[var(--accents-4)] w-28">检测时间</th>';
     html += '</tr></thead><tbody>';
+
     for (const p of proxies) {
       const statusColor = p.ok ? 'text-green-600' : 'text-red-500';
       const statusText = p.ok ? '健康' : '异常';
-      const tsText = p.ts ? new Date(p.ts * 1000).toLocaleString() : '-';
-      const shortUrl = p.url.length > 55 ? p.url.substring(0, 25) + '...' + p.url.substring(p.url.length - 25) : p.url;
-      html += `<tr class="border-b border-[var(--border)] hover:bg-[var(--accents-1)]">`;
-      html += `<td class="py-2 px-2 font-mono text-xs" title="${p.url}">${shortUrl}</td>`;
-      html += `<td class="py-2 px-2 ${statusColor}">${statusText}</td>`;
-      html += `<td class="py-2 px-2 text-[var(--accents-4)] text-xs">${tsText}</td>`;
-      html += `</tr>`;
+      const tsText = p.ts > 0 ? new Date(p.ts * 1000).toLocaleString() : '未检测';
+      const shortUrl = _truncateUrl(p.url, 60);
+      html += '<tr class="border-b border-[var(--border)] hover:bg-[var(--accents-1)]">';
+      html += '<td class="py-2 px-2 font-mono text-xs" title="' + p.url.replace(/"/g, '&quot;') + '">' + shortUrl + '</td>';
+      html += '<td class="py-2 px-2 ' + statusColor + '">' + statusText + '</td>';
+      html += '<td class="py-2 px-2 text-[var(--accents-4)] text-xs">' + tsText + '</td>';
+      html += '</tr>';
     }
+
     html += '</tbody></table></div>';
     container.innerHTML = html;
   } catch (e) {
-    container.innerHTML = '<div class="text-center py-4 text-[var(--accents-4)] text-sm">加载失败: ' + e.message + '</div>';
+    if (e.name === 'AbortError') {
+      container.innerHTML = '<div class="text-center py-4 text-red-500 text-sm">加载超时，请刷新页面重试</div>';
+    } else {
+      container.innerHTML = '<div class="text-center py-4 text-red-500 text-sm">加载失败: ' + e.message + '</div>';
+    }
   }
 }
 
 async function refreshProxyPool() {
   const btn = byId('proxy-refresh-btn');
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span>检测中...</span>'; }
+  const container = byId('proxy-list-container');
+
+  // Disable button & show progress
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="inline-flex items-center gap-1"><svg class="animate-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg><span>检测中...</span></span>';
+  }
+  if (container) {
+    container.innerHTML = '<div class="text-center py-6 text-[var(--accents-4)] text-sm"><svg class="animate-spin inline-block mr-2" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>正在检测代理可用性（每个最多6秒超时，5个并发）...</div>';
+  }
+
   try {
-    const res = await fetch('/v1/admin/proxies/refresh', { method: 'POST', headers: buildAuthHeaders(apiKey) });
+    // Use longer timeout for refresh: 6s per proxy + buffer
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 min max
+
+    const res = await fetch('/v1/admin/proxies/refresh', {
+      method: 'POST',
+      headers: buildAuthHeaders(apiKey),
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
     if (res.ok) {
       const data = await res.json();
-      showToast(`检测完成: ${data.healthy}/${data.total} 个代理可用`, 'success');
+      if (data.total > 0) {
+        showToast('检测完成: ' + data.healthy + '/' + data.total + ' 个代理可用', 'success');
+      } else {
+        showToast('没有需要检测的代理', 'info');
+      }
       await loadProxyStatus();
-    } else { showToast('刷新失败', 'error'); }
-  } catch (e) { showToast('刷新失败: ' + e.message, 'error'); }
-  finally { if (btn) { btn.disabled = false; btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg><span>刷新检测</span>'; } }
+    } else {
+      showToast('检测失败 (HTTP ' + res.status + ')', 'error');
+      if (container) container.innerHTML = '<div class="text-center py-4 text-red-500 text-sm">检测请求失败 (HTTP ' + res.status + ')，请重试</div>';
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      showToast('检测超时，请减少代理数量后重试', 'error');
+      if (container) container.innerHTML = '<div class="text-center py-4 text-red-500 text-sm">检测超时，请减少代理数量或稍后重试</div>';
+    } else {
+      showToast('检测失败: ' + e.message, 'error');
+      if (container) container.innerHTML = '<div class="text-center py-4 text-red-500 text-sm">检测失败: ' + e.message + '</div>';
+    }
+  } finally {
+    // Always restore button
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg><span>刷新检测</span>';
+    }
+  }
 }
 
 async function importProxyPool() {
   const area = byId('proxy-import-area');
+  const btn = byId('proxy-import-btn');
   if (!area || !area.value.trim()) { showToast('请输入代理列表', 'error'); return; }
+
+  if (btn) { btn.disabled = true; btn.querySelector('span').textContent = '导入中...'; }
+
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
     const res = await fetch('/v1/admin/proxies', {
       method: 'POST',
       headers: { ...buildAuthHeaders(apiKey), 'Content-Type': 'text/plain' },
-      body: area.value
+      body: area.value,
+      signal: controller.signal
     });
+    clearTimeout(timeoutId);
+
     if (res.ok) {
       const data = await res.json();
       if (data.success) {
-        showToast(`导入成功: ${data.imported} 个代理`, 'success');
+        showToast('导入成功: ' + data.imported + ' 个代理', 'success');
         area.value = '';
         const proxyInput = document.querySelector('input[data-section="proxy"][data-key="base_proxy_url"]');
         if (proxyInput) proxyInput.value = data.proxies.join(',');
         await loadProxyStatus();
-      } else { showToast(data.message || '导入失败', 'error'); }
-    } else { showToast('导入失败', 'error'); }
-  } catch (e) { showToast('导入失败: ' + e.message, 'error'); }
+      } else {
+        showToast(data.message || '导入失败', 'error');
+      }
+    } else {
+      showToast('导入失败 (HTTP ' + res.status + ')', 'error');
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      showToast('导入超时', 'error');
+    } else {
+      showToast('导入失败: ' + e.message, 'error');
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.querySelector('span').textContent = '导入代理'; }
+  }
 }
 
 async function clearProxyPool() {
