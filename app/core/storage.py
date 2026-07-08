@@ -14,7 +14,10 @@ import os
 import asyncio
 import hashlib
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 from typing import Any, ClassVar, Dict, Optional
 from pathlib import Path
 from enum import Enum

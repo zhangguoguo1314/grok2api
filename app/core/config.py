@@ -9,7 +9,10 @@ from copy import deepcopy
 import asyncio
 from pathlib import Path
 from typing import Any, Dict
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 from app.core.logger import logger
 

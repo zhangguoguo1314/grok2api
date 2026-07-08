@@ -5,7 +5,10 @@ Grok 服务默认配置
 """
 
 from pathlib import Path
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 from app.core.logger import logger
 
